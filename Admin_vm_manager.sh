@@ -17,6 +17,14 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# ---------- Trim function ----------
+trim() {
+    local var="$1"
+    var="${var#"${var%%[![:space:]]*}"}"   # remove leading whitespace
+    var="${var%"${var##*[![:space:]]}"}"   # remove trailing whitespace
+    echo -n "$var"
+}
+
 # ---------- Check Dependencies ----------
 check_deps() {
     echo -e "${CYAN}Checking dependencies...${NC}"
@@ -26,14 +34,9 @@ check_deps() {
             missing+=("$dep")
         fi
     done
-    # Check d2vm separately
     if ! command -v d2vm &>/dev/null; then
         echo -e "${RED}Missing: d2vm${NC}"
         echo "Install d2vm from: https://github.com/linka-cloud/d2vm"
-        echo "Quick install:"
-        echo '  VERSION=$(curl -s https://api.github.com/repos/linka-cloud/d2vm/releases/latest | grep tag_name | cut -d '"'"'"'"'"'"'"'"' -f 4)'
-        echo '  curl -sL "https://github.com/linka-cloud/d2vm/releases/download/${VERSION}/d2vm_${VERSION}_$(uname -s | tr "[:upper:]" "[:lower:]")_$( [ "$(uname -m)" = "x86_64" ] && echo "amd64" || echo "arm64" ).tar.gz" | tar -xvz d2vm'
-        echo '  sudo mv d2vm /usr/local/bin/'
         exit 1
     fi
     if [ ${#missing[@]} -gt 0 ]; then
@@ -44,22 +47,21 @@ check_deps() {
     echo -e "${GREEN}✓ All dependencies installed${NC}"
 }
 
-# ---------- Docker Build (with .dockerignore fix) ----------
+# ---------- Docker Build (safe) ----------
 docker_build() {
     local tag="$1"
     local dockerfile="$2"
     local context_dir="$(dirname "$dockerfile")"
 
-    # Create .dockerignore in the context directory to prevent the error
+    # Ensure .dockerignore exists
     if [ ! -f "${context_dir}/.dockerignore" ]; then
         echo "*" > "${context_dir}/.dockerignore"
     fi
 
-    # Check if BuildKit is available and supports --progress
+    # Use BuildKit only if supported, otherwise plain build
     if docker build --help 2>&1 | grep -q progress; then
         DOCKER_BUILDKIT=1 docker build --progress=plain -t "$tag" -f "$dockerfile" "$context_dir"
     else
-        # Fallback: build without --progress
         docker build -t "$tag" -f "$dockerfile" "$context_dir"
     fi
 }
@@ -71,14 +73,34 @@ create_vm() {
     echo -e "${CYAN}       CREATE NEW VM${NC}"
     echo -e "${CYAN}=========================================${NC}"
 
-    read -p "Docker image (e.g., ubuntu:22.04): " DOCKER_IMAGE
-    read -p "VM name: " VM_NAME
-    read -p "Disk size (e.g., 20G): " DISK_SIZE
-    read -p "CPU cores: " CPU_CORES
-    read -p "RAM (MB): " RAM_MB
-    read -p "Username: " VM_USER
-    read -s -p "Password: " VM_PASS; echo
-    read -p "Enable SSH? (y/n): " ENABLE_SSH
+    read -p "Docker image (e.g., ubuntu:22.04): " raw_image
+    DOCKER_IMAGE=$(trim "$raw_image")
+    while [ -z "$DOCKER_IMAGE" ]; do
+        echo -e "${RED}Image name cannot be empty.${NC}"
+        read -p "Docker image (e.g., ubuntu:22.04): " raw_image
+        DOCKER_IMAGE=$(trim "$raw_image")
+    done
+
+    read -p "VM name: " raw_name
+    VM_NAME=$(trim "$raw_name")
+    while [ -z "$VM_NAME" ]; do
+        echo -e "${RED}VM name cannot be empty.${NC}"
+        read -p "VM name: " raw_name
+        VM_NAME=$(trim "$raw_name")
+    done
+
+    read -p "Disk size (e.g., 20G): " raw_disk
+    DISK_SIZE=$(trim "$raw_disk")
+    read -p "CPU cores: " raw_cpu
+    CPU_CORES=$(trim "$raw_cpu")
+    read -p "RAM (MB): " raw_ram
+    RAM_MB=$(trim "$raw_ram")
+    read -p "Username: " raw_user
+    VM_USER=$(trim "$raw_user")
+    read -s -p "Password: " raw_pass; echo
+    VM_PASS=$(trim "$raw_pass")
+    read -p "Enable SSH? (y/n): " raw_ssh
+    ENABLE_SSH=$(trim "$raw_ssh")
 
     OUTPUT_IMAGE="${VM_DIR}/${VM_NAME}.qcow2"
     mkdir -p "$VM_DIR"
@@ -116,7 +138,11 @@ RUN if [ "${ENABLE_SSH}" = "y" ]; then systemctl enable ssh || true; fi
 EXPOSE 8080 443 22
 EOF
 
-    # Build using the compatible function
+    # Debug: print the Dockerfile (remove if not needed)
+    echo -e "${CYAN}--- Dockerfile content ---${NC}"
+    cat "${VM_DIR}/Dockerfile.wings"
+    echo -e "${CYAN}--------------------------${NC}"
+
     docker_build "${VM_NAME}-with-wings" "${VM_DIR}/Dockerfile.wings"
 
     # Convert to VM
@@ -137,7 +163,6 @@ EOF
         echo -e "${YELLOW}[3/4] Skipping virt-customize (not installed)${NC}"
     fi
 
-    # Save current VM
     echo "$VM_NAME" > "${VM_DIR}/current_vm.name"
     echo "$OUTPUT_IMAGE" > "${VM_DIR}/current_vm.image"
 
@@ -153,7 +178,7 @@ EOF
     echo -e "${GREEN}=========================================${NC}"
 }
 
-# ---------- Start VM ----------
+# ---------- Start / Stop / Console (same as before) ----------
 start_vm() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${YELLOW}VM is already running (PID $(cat "$PID_FILE")).${NC}"
@@ -184,7 +209,6 @@ start_vm() {
     fi
 }
 
-# ---------- Stop VM ----------
 stop_vm() {
     if [ ! -f "$PID_FILE" ]; then
         echo -e "${YELLOW}No VM is running.${NC}"
@@ -205,7 +229,6 @@ stop_vm() {
     fi
 }
 
-# ---------- Console ----------
 console_vm() {
     if [ "$CONSOLE_TYPE" = "vnc" ]; then
         if command -v vncviewer &>/dev/null; then
@@ -222,7 +245,6 @@ console_vm() {
     fi
 }
 
-# ---------- Menu ----------
 show_menu() {
     clear
     echo "========================================="
