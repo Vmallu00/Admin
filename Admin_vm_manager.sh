@@ -176,8 +176,9 @@ EOF
     docker_build "${VM_NAME}-with-wings" "${VM_DIR}/Dockerfile.wings"
 
     echo -e "${YELLOW}[2/4] Converting to VM disk image (this may take a while)...${NC}"
-    # ✅ FIX: removed --format, it's inferred from .qcow2 extension
+    # ✅ FIX: --local prevents pulling from registry, --format removed (inferred from .qcow2)
     sudo d2vm convert "${VM_NAME}-with-wings" \
+        --local \
         --output "$OUTPUT_IMAGE" \
         --size "$DISK_SIZE" \
         --verbose
@@ -206,7 +207,7 @@ EOF
     echo -e "${GREEN}=========================================${NC}"
 }
 
-# ---------- Start / Stop / Console (unchanged) ----------
+# ---------- Start VM ----------
 start_vm() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${YELLOW}VM is already running (PID $(cat "$PID_FILE")).${NC}"
@@ -237,6 +238,7 @@ start_vm() {
     fi
 }
 
+# ---------- Stop VM ----------
 stop_vm() {
     if [ ! -f "$PID_FILE" ]; then
         echo -e "${YELLOW}No VM is running.${NC}"
@@ -257,6 +259,7 @@ stop_vm() {
     fi
 }
 
+# ---------- Console ----------
 console_vm() {
     if [ "$CONSOLE_TYPE" = "vnc" ]; then
         if command -v vncviewer &>/dev/null; then
@@ -273,6 +276,7 @@ console_vm() {
     fi
 }
 
+# ---------- Menu ----------
 show_menu() {
     clear
     echo "========================================="
