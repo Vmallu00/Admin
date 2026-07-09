@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # =============================================
-#  Docker → VM Manager (Admin Version)
-#  Usage: bash <(curl -fsSL https://raw.githubusercontent.com/Vmallu00/pterodactyl/master/admin_vm_manager.sh)
+#  Docker → VM Manager (Admin) – Compatible
+#  Usage: bash <(curl -fsSL ...)
 # =============================================
 
 set -e
 
 VM_DIR="${HOME}/docker-vms"
 PID_FILE="${VM_DIR}/vm.pid"
-CONSOLE_TYPE="serial"   # Change to "vnc" if you prefer VNC
+CONSOLE_TYPE="serial"   # or "vnc"
 
 # Colors
 RED='\033[0;31m'
@@ -21,21 +21,43 @@ NC='\033[0m'
 check_deps() {
     echo -e "${CYAN}Checking dependencies...${NC}"
     local missing=()
-    for dep in docker d2vm qemu-system-x86_64 qemu-img screen; do
+    for dep in docker qemu-system-x86_64 qemu-img screen; do
         if ! command -v "$dep" &>/dev/null; then
             missing+=("$dep")
         fi
     done
+    # Check d2vm separately
+    if ! command -v d2vm &>/dev/null; then
+        echo -e "${RED}Missing: d2vm${NC}"
+        echo "Install d2vm from: https://github.com/linka-cloud/d2vm"
+        echo "Quick install:"
+        echo '  VERSION=$(curl -s https://api.github.com/repos/linka-cloud/d2vm/releases/latest | grep tag_name | cut -d '"'"'"'"'"'"'"'"' -f 4)'
+        echo '  curl -sL "https://github.com/linka-cloud/d2vm/releases/download/${VERSION}/d2vm_${VERSION}_$(uname -s | tr "[:upper:]" "[:lower:]")_$( [ "$(uname -m)" = "x86_64" ] && echo "amd64" || echo "arm64" ).tar.gz" | tar -xvz d2vm'
+        echo '  sudo mv d2vm /usr/local/bin/'
+        exit 1
+    fi
     if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${RED}Missing dependencies: ${missing[*]}${NC}"
-        echo "Install them with: sudo apt install ${missing[*]}"
-        echo "Also install d2vm from: https://github.com/linka-cloud/d2vm"
+        echo -e "${RED}Missing: ${missing[*]}${NC}"
+        echo "Install: sudo apt install ${missing[*]}"
         exit 1
     fi
     echo -e "${GREEN}✓ All dependencies installed${NC}"
 }
 
-# ---------- Create VM (with real verbose output) ----------
+# ---------- Docker Build (with/without --progress) ----------
+docker_build() {
+    local tag="$1"
+    local dockerfile="$2"
+    # Check if BuildKit is available and supports --progress
+    if docker build --help 2>&1 | grep -q progress; then
+        DOCKER_BUILDKIT=1 docker build --progress=plain -t "$tag" -f "$dockerfile" .
+    else
+        # Fallback: just build without --progress (still shows layer output)
+        docker build -t "$tag" -f "$dockerfile" .
+    fi
+}
+
+# ---------- Create VM ----------
 create_vm() {
     clear
     echo -e "${CYAN}=========================================${NC}"
@@ -54,7 +76,7 @@ create_vm() {
     OUTPUT_IMAGE="${VM_DIR}/${VM_NAME}.qcow2"
     mkdir -p "$VM_DIR"
 
-    # Save VM config
+    # Save config
     cat > "${VM_DIR}/${VM_NAME}.conf" << EOF
 VM_NAME=$VM_NAME
 DISK_SIZE=$DISK_SIZE
@@ -66,7 +88,7 @@ OUTPUT_IMAGE=$OUTPUT_IMAGE
 ENABLE_SSH=$ENABLE_SSH
 EOF
 
-    # Build Dockerfile with Wings + user
+    # Build Dockerfile
     echo -e "${YELLOW}[1/4] Building Docker image with Wings + user...${NC}"
     cat > "${VM_DIR}/Dockerfile.wings" << EOF
 FROM ${DOCKER_IMAGE}
@@ -87,17 +109,18 @@ RUN if [ "${ENABLE_SSH}" = "y" ]; then systemctl enable ssh || true; fi
 EXPOSE 8080 443 22
 EOF
 
-    docker build --progress=plain -t "${VM_NAME}-with-wings" -f "${VM_DIR}/Dockerfile.wings" .
+    # Build using the compatible function
+    docker_build "${VM_NAME}-with-wings" "${VM_DIR}/Dockerfile.wings"
 
     # Convert to VM
-    echo -e "${YELLOW}[2/4] Converting to VM disk image (this takes a while)...${NC}"
+    echo -e "${YELLOW}[2/4] Converting to VM disk image...${NC}"
     sudo d2vm convert "${VM_NAME}-with-wings" \
         --output "$OUTPUT_IMAGE" \
         --size "$DISK_SIZE" \
         --format qcow2 \
         --verbose
 
-    # Extra password hardening
+    # Optional password hardening
     if command -v virt-customize &>/dev/null; then
         echo -e "${YELLOW}[3/4] Hardening password with virt-customize...${NC}"
         sudo virt-customize -a "$OUTPUT_IMAGE" \
@@ -123,28 +146,24 @@ EOF
     echo -e "${GREEN}=========================================${NC}"
 }
 
-# ---------- Start VM ----------
+# ---------- Start / Stop / Console (unchanged) ----------
 start_vm() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${YELLOW}VM is already running (PID $(cat "$PID_FILE")).${NC}"
         return
     fi
-
     VM_NAME=$(cat "${VM_DIR}/current_vm.name" 2>/dev/null)
     if [ -z "$VM_NAME" ]; then
         echo -e "${RED}No VM found. Create one first (Option 1).${NC}"
         return
     fi
-
     source "${VM_DIR}/${VM_NAME}.conf"
     if [ ! -f "$OUTPUT_IMAGE" ]; then
         echo -e "${RED}Image file not found: $OUTPUT_IMAGE${NC}"
         return
     fi
-
     echo -e "${GREEN}Starting $VM_NAME with ${CPU_CORES} cores, ${RAM_MB}MB RAM...${NC}"
     QEMU_OPTS="-m $RAM_MB -smp cores=$CPU_CORES -drive file=$OUTPUT_IMAGE,format=qcow2 -netdev user,id=net0 -device virtio-net-pci,netdev=net0"
-
     if [ "$CONSOLE_TYPE" = "vnc" ]; then
         qemu-system-x86_64 $QEMU_OPTS -vnc :0 -daemonize
         echo $! > "$PID_FILE"
@@ -158,13 +177,11 @@ start_vm() {
     fi
 }
 
-# ---------- Stop VM ----------
 stop_vm() {
     if [ ! -f "$PID_FILE" ]; then
         echo -e "${YELLOW}No VM is running.${NC}"
         return
     fi
-
     PID=$(cat "$PID_FILE")
     if [ "$PID" = "screen" ]; then
         screen -S docker-vm -X quit 2>/dev/null && echo -e "${GREEN}VM stopped.${NC}" || echo -e "${YELLOW}Already stopped.${NC}"
@@ -180,7 +197,6 @@ stop_vm() {
     fi
 }
 
-# ---------- Console ----------
 console_vm() {
     if [ "$CONSOLE_TYPE" = "vnc" ]; then
         if command -v vncviewer &>/dev/null; then
@@ -197,7 +213,6 @@ console_vm() {
     fi
 }
 
-# ---------- Menu ----------
 show_menu() {
     clear
     echo "========================================="
