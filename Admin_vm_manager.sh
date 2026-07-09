@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================
-#  Docker → VM Manager (Admin) – Compatible
+#  Docker → VM Manager (Admin) – Fixed
 #  Usage: bash <(curl -fsSL ...)
 # =============================================
 
@@ -44,16 +44,23 @@ check_deps() {
     echo -e "${GREEN}✓ All dependencies installed${NC}"
 }
 
-# ---------- Docker Build (with/without --progress) ----------
+# ---------- Docker Build (with .dockerignore fix) ----------
 docker_build() {
     local tag="$1"
     local dockerfile="$2"
+    local context_dir="$(dirname "$dockerfile")"
+
+    # Create .dockerignore in the context directory to prevent the error
+    if [ ! -f "${context_dir}/.dockerignore" ]; then
+        echo "*" > "${context_dir}/.dockerignore"
+    fi
+
     # Check if BuildKit is available and supports --progress
     if docker build --help 2>&1 | grep -q progress; then
-        DOCKER_BUILDKIT=1 docker build --progress=plain -t "$tag" -f "$dockerfile" .
+        DOCKER_BUILDKIT=1 docker build --progress=plain -t "$tag" -f "$dockerfile" "$context_dir"
     else
-        # Fallback: just build without --progress (still shows layer output)
-        docker build -t "$tag" -f "$dockerfile" .
+        # Fallback: build without --progress
+        docker build -t "$tag" -f "$dockerfile" "$context_dir"
     fi
 }
 
@@ -146,7 +153,7 @@ EOF
     echo -e "${GREEN}=========================================${NC}"
 }
 
-# ---------- Start / Stop / Console (unchanged) ----------
+# ---------- Start VM ----------
 start_vm() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${YELLOW}VM is already running (PID $(cat "$PID_FILE")).${NC}"
@@ -177,6 +184,7 @@ start_vm() {
     fi
 }
 
+# ---------- Stop VM ----------
 stop_vm() {
     if [ ! -f "$PID_FILE" ]; then
         echo -e "${YELLOW}No VM is running.${NC}"
@@ -197,6 +205,7 @@ stop_vm() {
     fi
 }
 
+# ---------- Console ----------
 console_vm() {
     if [ "$CONSOLE_TYPE" = "vnc" ]; then
         if command -v vncviewer &>/dev/null; then
@@ -213,6 +222,7 @@ console_vm() {
     fi
 }
 
+# ---------- Menu ----------
 show_menu() {
     clear
     echo "========================================="
