@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # =====================================================
-#  Docker → VM Manager (Admin)
-#  Create, Start, Stop, Console a VM with Wings pre‑installed
-#  Usage: bash <(curl -fsSL https://raw.githubusercontent.com/Vmallu00/pterodactyl/master/admin_vm_manager.sh)
+#  Docker → VM Manager (Admin) – FINAL
+#  Auto-upgrades d2vm if needed
 # =====================================================
 
 set -e
 
 VM_DIR="${HOME}/docker-vms"
 PID_FILE="${VM_DIR}/vm.pid"
-CONSOLE_TYPE="serial"   # or "vnc"
+CONSOLE_TYPE="serial"
 
 # Colors
 RED='\033[0;31m'
@@ -18,18 +17,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# ---------- Detect if running inside a container ----------
-check_container() {
-    if [ -f /.dockerenv ] || grep -q docker /proc/1/cgroup 2>/dev/null; then
-        echo -e "${YELLOW}⚠️  You are running inside a Docker container.${NC}"
-        echo -e "${YELLOW}   Building a VM inside a container often fails due to overlay mount limitations.${NC}"
-        echo -e "${YELLOW}   It is strongly recommended to run this script on the host machine.${NC}"
-        echo
-        read -p "Press Enter to continue anyway, or Ctrl+C to abort..."
-    fi
-}
-
-# ---------- Trim input ----------
+# ---------- Trim ----------
 trim() {
     local var="$1"
     var="${var#"${var%%[![:space:]]*}"}"
@@ -37,24 +25,38 @@ trim() {
     echo -n "$var"
 }
 
-# ---------- Check dependencies ----------
+# ---------- Upgrade d2vm if needed ----------
+upgrade_d2vm() {
+    if ! command -v d2vm &>/dev/null; then
+        echo -e "${RED}d2vm not found. Installing...${NC}"
+    else
+        # Check if --local is supported
+        if d2vm convert --help 2>&1 | grep -q -- '--local'; then
+            echo -e "${GREEN}✓ d2vm already supports --local${NC}"
+            return 0
+        fi
+        echo -e "${YELLOW}Upgrading d2vm to latest version (supports --local)...${NC}"
+        sudo rm -f /usr/local/bin/d2vm
+    fi
+
+    VERSION=$(curl -s https://api.github.com/repos/linka-cloud/d2vm/releases/latest | grep tag_name | cut -d '"' -f 4)
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    ARCH=$([ "$(uname -m)" = "x86_64" ] && echo "amd64" || echo "arm64")
+    curl -sL "https://github.com/linka-cloud/d2vm/releases/download/${VERSION}/d2vm_${VERSION}_${OS}_${ARCH}.tar.gz" | tar -xvz d2vm
+    sudo mv d2vm /usr/local/bin/
+    sudo chmod +x /usr/local/bin/d2vm
+    echo -e "${GREEN}✓ d2vm upgraded to ${VERSION}${NC}"
+}
+
+# ---------- Check other deps ----------
 check_deps() {
     echo -e "${CYAN}Checking dependencies...${NC}"
     local missing=()
-    for dep in docker qemu-system-x86_64 qemu-img screen; do
+    for dep in docker qemu-system-x86_64 qemu-img screen curl; do
         if ! command -v "$dep" &>/dev/null; then
             missing+=("$dep")
         fi
     done
-    if ! command -v d2vm &>/dev/null; then
-        echo -e "${RED}Missing: d2vm${NC}"
-        echo "Install d2vm from: https://github.com/linka-cloud/d2vm"
-        echo "Quick install:"
-        echo '  VERSION=$(curl -s https://api.github.com/repos/linka-cloud/d2vm/releases/latest | grep tag_name | cut -d '"'"'"'"'"'"'"'"' -f 4)'
-        echo '  curl -sL "https://github.com/linka-cloud/d2vm/releases/download/${VERSION}/d2vm_${VERSION}_$(uname -s | tr "[:upper:]" "[:lower:]")_$( [ "$(uname -m)" = "x86_64" ] && echo "amd64" || echo "arm64" ).tar.gz" | tar -xvz d2vm'
-        echo '  sudo mv d2vm /usr/local/bin/'
-        exit 1
-    fi
     if [ ${#missing[@]} -gt 0 ]; then
         echo -e "${RED}Missing: ${missing[*]}${NC}"
         echo "Install: sudo apt install ${missing[*]}"
@@ -63,7 +65,7 @@ check_deps() {
     echo -e "${GREEN}✓ All dependencies installed${NC}"
 }
 
-# ---------- Docker build (handles missing --progress flag) ----------
+# ---------- Docker build ----------
 docker_build() {
     local tag="$1"
     local dockerfile="$2"
@@ -176,13 +178,9 @@ EOF
     docker_build "${VM_NAME}-with-wings" "${VM_DIR}/Dockerfile.wings"
 
     echo -e "${YELLOW}[2/4] Converting to VM disk image (this may take a while)...${NC}"
-    # ✅ FIX: use image ID to avoid registry pulls
-    IMAGE_ID=$(docker images --format "{{.ID}}" "${VM_NAME}-with-wings")
-    if [ -z "$IMAGE_ID" ]; then
-        echo -e "${RED}Failed to get image ID for ${VM_NAME}-with-wings${NC}"
-        exit 1
-    fi
-    sudo d2vm convert "$IMAGE_ID" \
+    # Use --local (now supported after upgrade)
+    sudo d2vm convert "${VM_NAME}-with-wings" \
+        --local \
         --output "$OUTPUT_IMAGE" \
         --size "$DISK_SIZE" \
         --verbose
@@ -302,7 +300,7 @@ show_menu() {
 }
 
 # ---------- Main ----------
-check_container
 check_deps
+upgrade_d2vm
 mkdir -p "$VM_DIR"
 while true; do show_menu; done
