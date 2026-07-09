@@ -176,12 +176,17 @@ EOF
     docker_build "${VM_NAME}-with-wings" "${VM_DIR}/Dockerfile.wings"
 
     echo -e "${YELLOW}[2/4] Converting to VM disk image (this may take a while)...${NC}"
-    # ✅ FIX: --local prevents pulling from registry, --format removed (inferred from .qcow2)
-    sudo d2vm convert "${VM_NAME}-with-wings" \
-    --local \
-    --output "$OUTPUT_IMAGE" \
-    --size "$DISK_SIZE" \
-    --verbose
+    # ✅ FIX: use image ID to avoid registry pulls
+    IMAGE_ID=$(docker images --format "{{.ID}}" "${VM_NAME}-with-wings")
+    if [ -z "$IMAGE_ID" ]; then
+        echo -e "${RED}Failed to get image ID for ${VM_NAME}-with-wings${NC}"
+        exit 1
+    fi
+    sudo d2vm convert "$IMAGE_ID" \
+        --output "$OUTPUT_IMAGE" \
+        --size "$DISK_SIZE" \
+        --verbose
+
     if command -v virt-customize &>/dev/null; then
         echo -e "${YELLOW}[3/4] Hardening password with virt-customize...${NC}"
         sudo virt-customize -a "$OUTPUT_IMAGE" \
@@ -206,7 +211,7 @@ EOF
     echo -e "${GREEN}=========================================${NC}"
 }
 
-# ---------- Start VM ----------
+# ---------- Start / Stop / Console (unchanged) ----------
 start_vm() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${YELLOW}VM is already running (PID $(cat "$PID_FILE")).${NC}"
@@ -237,7 +242,6 @@ start_vm() {
     fi
 }
 
-# ---------- Stop VM ----------
 stop_vm() {
     if [ ! -f "$PID_FILE" ]; then
         echo -e "${YELLOW}No VM is running.${NC}"
@@ -258,7 +262,6 @@ stop_vm() {
     fi
 }
 
-# ---------- Console ----------
 console_vm() {
     if [ "$CONSOLE_TYPE" = "vnc" ]; then
         if command -v vncviewer &>/dev/null; then
@@ -275,7 +278,6 @@ console_vm() {
     fi
 }
 
-# ---------- Menu ----------
 show_menu() {
     clear
     echo "========================================="
