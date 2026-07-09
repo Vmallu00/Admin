@@ -69,12 +69,10 @@ docker_build() {
     local dockerfile="$2"
     local context_dir="$(dirname "$dockerfile")"
 
-    # Create .dockerignore to avoid "context not found" errors
     if [ ! -f "${context_dir}/.dockerignore" ]; then
         echo "*" > "${context_dir}/.dockerignore"
     fi
 
-    # Use BuildKit only if supported
     if docker build --help 2>&1 | grep -q progress; then
         DOCKER_BUILDKIT=1 docker build --progress=plain -t "$tag" -f "$dockerfile" "$context_dir"
     else
@@ -144,7 +142,6 @@ create_vm() {
     OUTPUT_IMAGE="${VM_DIR}/${VM_NAME}.qcow2"
     mkdir -p "$VM_DIR"
 
-    # Save config
     cat > "${VM_DIR}/${VM_NAME}.conf" << EOF
 VM_NAME=$VM_NAME
 DISK_SIZE=$DISK_SIZE
@@ -156,7 +153,6 @@ OUTPUT_IMAGE=$OUTPUT_IMAGE
 ENABLE_SSH=$ENABLE_SSH
 EOF
 
-    # Build Dockerfile
     echo -e "${YELLOW}[1/4] Building Docker image with Wings + user...${NC}"
     cat > "${VM_DIR}/Dockerfile.wings" << EOF
 FROM ${DOCKER_IMAGE}
@@ -177,18 +173,15 @@ RUN if [ "${ENABLE_SSH}" = "y" ]; then systemctl enable ssh || true; fi
 EXPOSE 8080 443 22
 EOF
 
-    # Build the image
     docker_build "${VM_NAME}-with-wings" "${VM_DIR}/Dockerfile.wings"
 
-    # Convert to VM
     echo -e "${YELLOW}[2/4] Converting to VM disk image (this may take a while)...${NC}"
+    # ✅ FIX: removed --format, it's inferred from .qcow2 extension
     sudo d2vm convert "${VM_NAME}-with-wings" \
         --output "$OUTPUT_IMAGE" \
         --size "$DISK_SIZE" \
-        --format qcow2 \
         --verbose
 
-    # Optional password hardening
     if command -v virt-customize &>/dev/null; then
         echo -e "${YELLOW}[3/4] Hardening password with virt-customize...${NC}"
         sudo virt-customize -a "$OUTPUT_IMAGE" \
@@ -213,7 +206,7 @@ EOF
     echo -e "${GREEN}=========================================${NC}"
 }
 
-# ---------- Start VM ----------
+# ---------- Start / Stop / Console (unchanged) ----------
 start_vm() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${YELLOW}VM is already running (PID $(cat "$PID_FILE")).${NC}"
@@ -244,7 +237,6 @@ start_vm() {
     fi
 }
 
-# ---------- Stop VM ----------
 stop_vm() {
     if [ ! -f "$PID_FILE" ]; then
         echo -e "${YELLOW}No VM is running.${NC}"
@@ -265,7 +257,6 @@ stop_vm() {
     fi
 }
 
-# ---------- Console ----------
 console_vm() {
     if [ "$CONSOLE_TYPE" = "vnc" ]; then
         if command -v vncviewer &>/dev/null; then
@@ -282,7 +273,6 @@ console_vm() {
     fi
 }
 
-# ---------- Menu ----------
 show_menu() {
     clear
     echo "========================================="
