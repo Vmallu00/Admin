@@ -178,11 +178,10 @@ EOF
     echo -e "${YELLOW}[2/4] Converting to VM disk image (this may take a while)...${NC}"
     # ✅ FIX: --local prevents pulling from registry, --format removed (inferred from .qcow2)
     sudo d2vm convert "${VM_NAME}-with-wings" \
-        --local \
-        --output "$OUTPUT_IMAGE" \
-        --size "$DISK_SIZE" \
-        --verbose
-
+    --local \
+    --output "$OUTPUT_IMAGE" \
+    --size "$DISK_SIZE" \
+    --verbose
     if command -v virt-customize &>/dev/null; then
         echo -e "${YELLOW}[3/4] Hardening password with virt-customize...${NC}"
         sudo virt-customize -a "$OUTPUT_IMAGE" \
