@@ -1,306 +1,405 @@
-#!/usr/bin/env bash
-# =====================================================
-#  Docker → VM Manager (Admin) – FINAL
-#  Auto-upgrades d2vm if needed
-# =====================================================
-
+#!/bin/bash
 set -e
 
-VM_DIR="${HOME}/docker-vms"
-PID_FILE="${VM_DIR}/vm.pid"
-CONSOLE_TYPE="serial"
+# --------------------------------------------
+# Configuration
+# --------------------------------------------
+VM_BASE_DIR="${VM_BASE_DIR:-$HOME/vms}"
+SSH_DEFAULT_PORT=2222
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# Ensure base directory exists and is absolute
+mkdir -p "$VM_BASE_DIR"
+VM_BASE_DIR=$(realpath "$VM_BASE_DIR")
 
-# ---------- Trim ----------
-trim() {
-    local var="$1"
-    var="${var#"${var%%[![:space:]]*}"}"
-    var="${var%"${var##*[![:space:]]}"}"
-    echo -n "$var"
-}
-
-# ---------- Upgrade d2vm if needed ----------
-upgrade_d2vm() {
-    if ! command -v d2vm &>/dev/null; then
-        echo -e "${RED}d2vm not found. Installing...${NC}"
+# --------------------------------------------
+# 1. OS detection & minimal QEMU install
+# --------------------------------------------
+install_qemu() {
+    if command -v apk &>/dev/null; then
+        apk add --no-cache qemu-system-x86_64 qemu-img curl genisoimage
+    elif command -v apt &>/dev/null; then
+        apt update
+        apt install -y qemu-system-x86 qemu-utils curl genisoimage --no-install-recommends
+    elif command -v dnf &>/dev/null; then
+        dnf install -y qemu-kvm qemu-img curl genisoimage
+    elif command -v yum &>/dev/null; then
+        yum install -y qemu-kvm qemu-img curl genisoimage
     else
-        # Check if --local is supported
-        if d2vm convert --help 2>&1 | grep -q -- '--local'; then
-            echo -e "${GREEN}✓ d2vm already supports --local${NC}"
-            return 0
-        fi
-        echo -e "${YELLOW}Upgrading d2vm to latest version (supports --local)...${NC}"
-        sudo rm -f /usr/local/bin/d2vm
-    fi
-
-    VERSION=$(curl -s https://api.github.com/repos/linka-cloud/d2vm/releases/latest | grep tag_name | cut -d '"' -f 4)
-    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-    ARCH=$([ "$(uname -m)" = "x86_64" ] && echo "amd64" || echo "arm64")
-    curl -sL "https://github.com/linka-cloud/d2vm/releases/download/${VERSION}/d2vm_${VERSION}_${OS}_${ARCH}.tar.gz" | tar -xvz d2vm
-    sudo mv d2vm /usr/local/bin/
-    sudo chmod +x /usr/local/bin/d2vm
-    echo -e "${GREEN}✓ d2vm upgraded to ${VERSION}${NC}"
-}
-
-# ---------- Check other deps ----------
-check_deps() {
-    echo -e "${CYAN}Checking dependencies...${NC}"
-    local missing=()
-    for dep in docker qemu-system-x86_64 qemu-img screen curl; do
-        if ! command -v "$dep" &>/dev/null; then
-            missing+=("$dep")
-        fi
-    done
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${RED}Missing: ${missing[*]}${NC}"
-        echo "Install: sudo apt install ${missing[*]}"
+        echo "❌ Unsupported OS. Install QEMU manually."
         exit 1
     fi
-    echo -e "${GREEN}✓ All dependencies installed${NC}"
 }
 
-# ---------- Docker build ----------
-docker_build() {
-    local tag="$1"
-    local dockerfile="$2"
-    local context_dir="$(dirname "$dockerfile")"
-
-    if [ ! -f "${context_dir}/.dockerignore" ]; then
-        echo "*" > "${context_dir}/.dockerignore"
+check_kvm() {
+    if [ ! -e /dev/kvm ]; then
+        echo "❌ /dev/kvm missing – mount it with -v /dev/kvm:/dev/kvm"
+        exit 1
     fi
+    if [ ! -w /dev/kvm ]; then
+        echo "❌ /dev/kvm not writable – run with --privileged or --group-add=$(stat -c '%g' /dev/kvm)"
+        exit 1
+    fi
+}
 
-    if docker build --help 2>&1 | grep -q progress; then
-        DOCKER_BUILDKIT=1 docker build --progress=plain -t "$tag" -f "$dockerfile" "$context_dir"
+# --------------------------------------------
+# 2. Helpers
+# --------------------------------------------
+find_free_port() {
+    local port=$1
+    while ss -lntn | grep -q ":$port "; do
+        ((port++))
+    done
+    echo "$port"
+}
+
+get_image_url() {
+    case "$1" in
+        1|ubuntu22) echo "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img" ;;
+        2|almalinux9) echo "https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2" ;;
+        3|centosstream9) echo "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2" ;;
+        4|ubuntu24) echo "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img" ;;
+        5|rocky9) echo "https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2" ;;
+        6|fedora40) echo "https://download.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/x86_64/images/Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2" ;;
+        7|debian11) echo "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2" ;;
+        8|debian13) echo "https://cloud.debian.org/images/cloud/trixie/latest/debian-trixie-genericcloud-amd64.qcow2" ;;
+        9|debian12) echo "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2" ;;
+        10|alpine) echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.2-x86_64.qcow2" ;;
+        *) echo "" ;;
+    esac
+}
+
+download_image() {
+    local url="$1" dest="$2" size="$3"
+    if [[ ! -f "$dest" ]]; then
+        echo "⬇️  Downloading image..."
+        curl -L -o "${dest}.tmp" "$url"
+        mv "${dest}.tmp" "$dest"
+        qemu-img resize "$dest" "$size"
+    fi
+}
+
+# --------------------------------------------
+# 3. Cloud-init ISO generation (for Ubuntu/Debian)
+# --------------------------------------------
+create_cloud_init_iso() {
+    local vm_dir="$1" username="$2" password="$3" hostname="$4"
+    mkdir -p "$vm_dir/cloud-init"
+    cat > "$vm_dir/cloud-init/meta-data" <<EOF
+instance-id: $hostname
+local-hostname: $hostname
+EOF
+    local hashed
+    if command -v openssl &>/dev/null; then
+        hashed=$(echo "$password" | openssl passwd -6 -stdin 2>/dev/null)
+    fi
+    if [[ -z "$hashed" ]]; then
+        hashed="$password"
+    fi
+    cat > "$vm_dir/cloud-init/user-data" <<EOF
+#cloud-config
+users:
+  - name: $username
+    passwd: "$hashed"
+    lock_passwd: false
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+ssh_pwauth: true
+chpasswd:
+  expire: false
+EOF
+    (cd "$vm_dir/cloud-init" && genisoimage -output seed.iso -volid cidata -joliet -rock meta-data user-data 2>/dev/null || mkisofs -output seed.iso -volid cidata -joliet -rock meta-data user-data)
+    echo "$vm_dir/cloud-init/seed.iso"
+}
+
+# --------------------------------------------
+# 4. VM status and listing
+# --------------------------------------------
+get_vm_status() {
+    local pid_file="$1/pid"
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file")
+        if ps -p "$pid" >/dev/null 2>&1; then
+            echo "running"
+            return
+        fi
+    fi
+    echo "stopped"
+}
+
+get_vm_list() {
+    local vms=()
+    if [[ -d "$VM_BASE_DIR" ]]; then
+        for d in "$VM_BASE_DIR"/*/; do
+            if [[ -f "$d/config.conf" ]]; then
+                vms+=("$(basename "$d")")
+            fi
+        done
+    fi
+    echo "${vms[@]}"
+}
+
+# --------------------------------------------
+# 5. Interactive selection (FIXED)
+# --------------------------------------------
+select_vm() {
+    local vms=($(get_vm_list))
+    if [[ ${#vms[@]} -eq 0 ]]; then
+        echo "📭 No VMs found." >&2
+        return 1
+    fi
+    echo "📁 Found ${#vms[@]} VM(s):" >&2
+    local i=1
+    for name in "${vms[@]}"; do
+        status=$(get_vm_status "$VM_BASE_DIR/$name")
+        case "$status" in
+            running) icon="▶️" ;;
+            *) icon="💤" ;;
+        esac
+        echo "   $i) $name $icon" >&2
+        ((i++))
+    done
+    local choice
+    read -p "🎯 Select VM (number or name): " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        local idx=$((choice-1))
+        if [[ $idx -ge 0 && $idx -lt ${#vms[@]} ]]; then
+            echo "${vms[$idx]}"
+            return 0
+        fi
     else
-        docker build -t "$tag" -f "$dockerfile" "$context_dir"
+        for name in "${vms[@]}"; do
+            if [[ "$name" == "$choice" ]]; then
+                echo "$name"
+                return 0
+            fi
+        done
     fi
+    echo "❌ Invalid selection." >&2
+    return 1
 }
 
-# ---------- Create VM ----------
+# --------------------------------------------
+# 6. VM operations
+# --------------------------------------------
 create_vm() {
-    clear
-    echo -e "${CYAN}=========================================${NC}"
-    echo -e "${CYAN}       CREATE NEW VM${NC}"
-    echo -e "${CYAN}=========================================${NC}"
-
-    read -p "Docker image (e.g., ubuntu:22.04): " raw_image
-    DOCKER_IMAGE=$(trim "$raw_image")
-    while [ -z "$DOCKER_IMAGE" ]; do
-        echo -e "${RED}Image name cannot be empty.${NC}"
-        read -p "Docker image (e.g., ubuntu:22.04): " raw_image
-        DOCKER_IMAGE=$(trim "$raw_image")
-    done
-
-    read -p "VM name: " raw_name
-    VM_NAME=$(trim "$raw_name")
-    while [ -z "$VM_NAME" ]; do
-        echo -e "${RED}VM name cannot be empty.${NC}"
-        read -p "VM name: " raw_name
-        VM_NAME=$(trim "$raw_name")
-    done
-
-    read -p "Disk size (e.g., 20G): " raw_disk
-    DISK_SIZE=$(trim "$raw_disk")
-    [[ -z "$DISK_SIZE" ]] && DISK_SIZE="20G"
-
-    read -p "CPU cores: " raw_cpu
-    CPU_CORES=$(trim "$raw_cpu")
-    [[ -z "$CPU_CORES" ]] && CPU_CORES="2"
-
-    read -p "RAM (MB): " raw_ram
-    RAM_MB=$(trim "$raw_ram")
-    [[ -z "$RAM_MB" ]] && RAM_MB="2048"
-
-    read -p "Username: " raw_user
-    VM_USER=$(trim "$raw_user")
-    while [ -z "$VM_USER" ]; do
-        echo -e "${RED}Username cannot be empty.${NC}"
-        read -p "Username: " raw_user
-        VM_USER=$(trim "$raw_user")
-    done
-    if [ "$VM_USER" = "root" ]; then
-        echo -e "${YELLOW}Warning: 'root' already exists. Creating 'admin' instead.${NC}"
-        VM_USER="admin"
+    echo "🆕 Creating a new VM"
+    echo "🌍 Select OS:"
+    echo "  1) Ubuntu 22.04"
+    echo "  2) AlmaLinux 9"
+    echo "  3) CentOS Stream 9"
+    echo "  4) Ubuntu 24.04"
+    echo "  5) Rocky Linux 9"
+    echo "  6) Fedora 40"
+    echo "  7) Debian 11"
+    echo "  8) Debian 13 (trixie)"
+    echo "  9) Debian 12"
+    echo "  10) Alpine"
+    read -p "🎯 Enter choice (1-10): " os_choice
+    local url=$(get_image_url "$os_choice")
+    if [[ -z "$url" ]]; then
+        echo "❌ Invalid choice."
+        return 1
     fi
 
-    read -s -p "Password: " raw_pass; echo
-    VM_PASS=$(trim "$raw_pass")
-    while [ -z "$VM_PASS" ]; do
-        echo -e "${RED}Password cannot be empty.${NC}"
-        read -s -p "Password: " raw_pass; echo
-        VM_PASS=$(trim "$raw_pass")
+    read -p "🏷️  VM name: " vm_name
+    if [[ -z "$vm_name" ]]; then
+        echo "❌ Name required."
+        return 1
+    fi
+    local vm_dir="$VM_BASE_DIR/$vm_name"
+    if [[ -d "$vm_dir" ]]; then
+        echo "❌ VM already exists."
+        return 1
+    fi
+    mkdir -p "$vm_dir"
+
+    read -p "🏠 Hostname (default: $vm_name): " hostname
+    hostname=${hostname:-$vm_name}
+    read -p "👤 Username (default: root): " username
+    username=${username:-root}
+    read -p "🔑 Password (default: root): " password
+    password=${password:-root}
+    read -p "💾 Disk size (default: 20G): " disk
+    disk=${disk:-20G}
+    read -p "🧠 Memory MB (default: 2048): " mem
+    mem=${mem:-2048}
+    read -p "⚡ CPUs (default: 2): " cpus
+    cpus=${cpus:-2}
+
+    local ssh_port
+    while true; do
+        read -p "🔌 SSH Port (default: $SSH_DEFAULT_PORT): " ssh_port
+        ssh_port=${ssh_port:-$SSH_DEFAULT_PORT}
+        local free=$(find_free_port "$ssh_port")
+        if [[ "$free" -eq "$ssh_port" ]]; then
+            break
+        else
+            echo "⚠️  Port $ssh_port busy, using $free instead."
+            ssh_port=$free
+            break
+        fi
     done
 
-    read -p "Enable SSH? (y/n): " raw_ssh
-    ENABLE_SSH=$(trim "$raw_ssh")
-    [[ -z "$ENABLE_SSH" ]] && ENABLE_SSH="n"
+    read -p "🖥️  GUI? (y/n, default: n): " gui
+    gui=${gui:-n}
+    read -p "🌐 Extra port forwards (e.g., 8080:80): " extra_ports
 
-    OUTPUT_IMAGE="${VM_DIR}/${VM_NAME}.qcow2"
-    mkdir -p "$VM_DIR"
+    local image_file="$vm_dir/disk.qcow2"
+    download_image "$url" "$image_file" "$disk"
 
-    cat > "${VM_DIR}/${VM_NAME}.conf" << EOF
-VM_NAME=$VM_NAME
-DISK_SIZE=$DISK_SIZE
-CPU_CORES=$CPU_CORES
-RAM_MB=$RAM_MB
-VM_USER=$VM_USER
-VM_PASS=$VM_PASS
-OUTPUT_IMAGE=$OUTPUT_IMAGE
-ENABLE_SSH=$ENABLE_SSH
-EOF
-
-    echo -e "${YELLOW}[1/4] Building Docker image with Wings + user...${NC}"
-    cat > "${VM_DIR}/Dockerfile.wings" << EOF
-FROM ${DOCKER_IMAGE}
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y \\
-    curl docker.io systemd openssh-server sudo \\
-    && rm -rf /var/lib/apt/lists/*
-RUN useradd -m -s /bin/bash ${VM_USER} \\
-    && echo "${VM_USER}:${VM_PASS}" | chpasswd \\
-    && usermod -aG sudo ${VM_USER} \\
-    && echo "${VM_USER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-RUN curl -L -o /usr/local/bin/wings \\
-    https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64 \\
-    && chmod +x /usr/local/bin/wings
-RUN mkdir -p /etc/pterodactyl /var/lib/pterodactyl/volumes
-RUN systemctl enable wings || true
-RUN if [ "${ENABLE_SSH}" = "y" ]; then systemctl enable ssh || true; fi
-EXPOSE 8080 443 22
-EOF
-
-    docker_build "${VM_NAME}-with-wings" "${VM_DIR}/Dockerfile.wings"
-
-    echo -e "${YELLOW}[2/4] Converting to VM disk image (this may take a while)...${NC}"
-    # Use --local (now supported after upgrade)
-    sudo d2vm convert "${VM_NAME}-with-wings" \
-        --local \
-        --output "$OUTPUT_IMAGE" \
-        --size "$DISK_SIZE" \
-        --verbose
-
-    if command -v virt-customize &>/dev/null; then
-        echo -e "${YELLOW}[3/4] Hardening password with virt-customize...${NC}"
-        sudo virt-customize -a "$OUTPUT_IMAGE" \
-            --run-command "echo '${VM_USER}:${VM_PASS}' | chpasswd" \
-            --run-command "systemctl enable ssh" 2>/dev/null || true
-    else
-        echo -e "${YELLOW}[3/4] Skipping virt-customize (not installed)${NC}"
+    local cloud_iso=""
+    if [[ "$os_choice" =~ ^(1|4|7|8|9)$ ]]; then
+        echo "📝 Generating cloud-init ISO..."
+        cloud_iso=$(create_cloud_init_iso "$vm_dir" "$username" "$password" "$hostname")
     fi
 
-    echo "$VM_NAME" > "${VM_DIR}/current_vm.name"
-    echo "$OUTPUT_IMAGE" > "${VM_DIR}/current_vm.image"
-
-    echo -e "${GREEN}=========================================${NC}"
-    echo -e "${GREEN}✅ VM CREATED SUCCESSFULLY!${NC}"
-    echo -e "${GREEN}=========================================${NC}"
-    echo -e "  Image: ${CYAN}$OUTPUT_IMAGE${NC}"
-    echo -e "  Disk:  ${CYAN}$DISK_SIZE${NC}"
-    echo -e "  CPU:   ${CYAN}$CPU_CORES cores${NC}"
-    echo -e "  RAM:   ${CYAN}$RAM_MB MB${NC}"
-    echo -e "  User:  ${CYAN}$VM_USER${NC}"
-    echo -e "  SSH:   ${CYAN}$ENABLE_SSH${NC}"
-    echo -e "${GREEN}=========================================${NC}"
+    cat > "$vm_dir/config.conf" <<EOF
+VM_NAME=$vm_name
+HOSTNAME=$hostname
+USERNAME=$username
+PASSWORD=$password
+DISK=$disk
+MEMORY=$mem
+CPUS=$cpus
+SSH_PORT=$ssh_port
+GUI=$gui
+EXTRA_PORTS=$extra_ports
+IMAGE=$image_file
+CLOUD_ISO=$cloud_iso
+OS_CHOICE=$os_choice
+EOF
+    echo "✅ VM '$vm_name' created successfully."
+    echo "🔑 Login: $username / $password"
+    echo "🔌 SSH: ssh -p $ssh_port $username@localhost"
 }
 
-# ---------- Start / Stop / Console (unchanged) ----------
 start_vm() {
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo -e "${YELLOW}VM is already running (PID $(cat "$PID_FILE")).${NC}"
-        return
+    local vm_name=$(select_vm) || return 1
+    local vm_dir="$VM_BASE_DIR/$vm_name"
+    local status=$(get_vm_status "$vm_dir")
+    if [[ "$status" == "running" ]]; then
+        echo "⚠️  VM is already running."
+        return 0
     fi
-    VM_NAME=$(cat "${VM_DIR}/current_vm.name" 2>/dev/null)
-    if [ -z "$VM_NAME" ]; then
-        echo -e "${RED}No VM found. Create one first (Option 1).${NC}"
-        return
+    source "$vm_dir/config.conf"
+
+    local cmd="qemu-system-x86_64"
+    cmd+=" -enable-kvm -m $MEMORY -smp cores=$CPUS -cpu host"
+    cmd+=" -drive file=$IMAGE,format=qcow2"
+    [[ -f "$CLOUD_ISO" ]] && cmd+=" -cdrom $CLOUD_ISO"
+    cmd+=" -nic user,hostfwd=tcp::$SSH_PORT-:22"
+    if [[ -n "$EXTRA_PORTS" ]]; then
+        IFS=',' read -ra ADDR <<< "$EXTRA_PORTS"
+        for pair in "${ADDR[@]}"; do
+            host_port=${pair%:*}
+            guest_port=${pair#*:}
+            cmd+=",hostfwd=tcp::$host_port-:$guest_port"
+        done
     fi
-    source "${VM_DIR}/${VM_NAME}.conf"
-    if [ ! -f "$OUTPUT_IMAGE" ]; then
-        echo -e "${RED}Image file not found: $OUTPUT_IMAGE${NC}"
-        return
-    fi
-    echo -e "${GREEN}Starting $VM_NAME with ${CPU_CORES} cores, ${RAM_MB}MB RAM...${NC}"
-    QEMU_OPTS="-m $RAM_MB -smp cores=$CPU_CORES -drive file=$OUTPUT_IMAGE,format=qcow2 -netdev user,id=net0 -device virtio-net-pci,netdev=net0"
-    if [ "$CONSOLE_TYPE" = "vnc" ]; then
-        qemu-system-x86_64 $QEMU_OPTS -vnc :0 -daemonize
-        echo $! > "$PID_FILE"
-        echo -e "${GREEN}Started on VNC display :0${NC}"
+    # Floppy disabled – we don't add -fda at all
+    if [[ "$GUI" == [yY] ]]; then
+        cmd+=" -vnc :0"
+        echo "🖥️  VNC on port 5900 (inside container)."
     else
-        screen -dmS docker-vm qemu-system-x86_64 $QEMU_OPTS -nographic -serial mon:stdio
-        echo "screen" > "$PID_FILE"
-        echo -e "${GREEN}Started in screen session 'docker-vm'${NC}"
-        echo -e "  Attach: ${CYAN}screen -r docker-vm${NC}"
-        echo -e "  Detach: ${CYAN}Ctrl+A D${NC}"
+        cmd+=" -nographic"
+    fi
+
+    echo "🚀 Starting VM '$vm_name' (SSH port $SSH_PORT)..."
+    read -p "Run in background? (y/n, default n): " bg
+    if [[ "$bg" == [yY] ]]; then
+        cmd+=" -daemonize -pidfile $vm_dir/pid"
+        eval $cmd
+        sleep 1
+        if [[ -f "$vm_dir/pid" ]]; then
+            echo "✅ VM started in background (PID $(cat $vm_dir/pid))"
+        else
+            echo "❌ Failed to start."
+        fi
+    else
+        echo "🔴 VM console below. Press Ctrl+A then X to exit (or Ctrl+C to stop)."
+        sleep 2
+        exec $cmd
     fi
 }
 
 stop_vm() {
-    if [ ! -f "$PID_FILE" ]; then
-        echo -e "${YELLOW}No VM is running.${NC}"
-        return
+    local vm_name=$(select_vm) || return 1
+    local vm_dir="$VM_BASE_DIR/$vm_name"
+    local status=$(get_vm_status "$vm_dir")
+    if [[ "$status" != "running" ]]; then
+        echo "⚠️  VM is not running."
+        return 0
     fi
-    PID=$(cat "$PID_FILE")
-    if [ "$PID" = "screen" ]; then
-        screen -S docker-vm -X quit 2>/dev/null && echo -e "${GREEN}VM stopped.${NC}" || echo -e "${YELLOW}Already stopped.${NC}"
-        rm -f "$PID_FILE"
-    else
-        if kill -0 "$PID" 2>/dev/null; then
-            kill "$PID" && echo -e "${GREEN}VM stopped.${NC}"
-            rm -f "$PID_FILE"
-        else
-            echo -e "${YELLOW}Stale PID file. Removing.${NC}"
-            rm -f "$PID_FILE"
-        fi
-    fi
+    local pid=$(cat "$vm_dir/pid")
+    echo "🛑 Stopping VM '$vm_name' (PID $pid)..."
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$vm_dir/pid"
+    echo "✅ Stopped."
 }
 
-console_vm() {
-    if [ "$CONSOLE_TYPE" = "vnc" ]; then
-        if command -v vncviewer &>/dev/null; then
-            vncviewer localhost:0
-        else
-            echo -e "${RED}vncviewer not installed. Install tigervnc-viewer.${NC}"
-        fi
-    else
-        if screen -list | grep -q docker-vm; then
-            screen -r docker-vm
-        else
-            echo -e "${RED}No screen session found. VM may not be running.${NC}"
-        fi
-    fi
+vm_info() {
+    local vm_name=$(select_vm) || return 1
+    local vm_dir="$VM_BASE_DIR/$vm_name"
+    echo "📊 Info for '$vm_name':"
+    cat "$vm_dir/config.conf"
+    echo "Status: $(get_vm_status "$vm_dir")"
 }
 
-show_menu() {
-    clear
-    echo "========================================="
-    echo "   ADMIN VM MANAGER (Docker → VM)"
-    echo "========================================="
-    echo " 1. Create VM (with Wings)"
-    echo " 2. Start VM"
-    echo " 3. Stop VM"
-    echo " 4. Console (serial/VNC)"
-    echo " 5. Exit"
-    echo "========================================="
-    read -p "Choose option [1-5]: " opt
-    case $opt in
+delete_vm() {
+    local vm_name=$(select_vm) || return 1
+    local vm_dir="$VM_BASE_DIR/$vm_name"
+    local status=$(get_vm_status "$vm_dir")
+    if [[ "$status" == "running" ]]; then
+        echo "⚠️  Stop it first."
+        return 1
+    fi
+    read -p "🗑️  Delete VM '$vm_name'? (y/N): " confirm
+    if [[ "$confirm" != [yY] ]]; then
+        echo "Cancelled."
+        return 0
+    fi
+    rm -rf "$vm_dir"
+    echo "✅ Deleted."
+}
+
+# --------------------------------------------
+# 7. Main menu
+# --------------------------------------------
+main_menu() {
+    echo ""
+    echo "📋 Main Menu"
+    echo "  1) 🆕 Create VM"
+    echo "  2) 🚀 Start VM"
+    echo "  3) 🛑 Stop VM"
+    echo "  4) 📊 VM Info"
+    echo "  5) 🗑️  Delete VM"
+    echo "  0) 👋 Exit"
+    read -p "🎯 Choice: " choice
+    case "$choice" in
         1) create_vm ;;
         2) start_vm ;;
         3) stop_vm ;;
-        4) console_vm ;;
-        5) echo -e "${GREEN}Bye!${NC}"; exit 0 ;;
-        *) echo -e "${RED}Invalid option.${NC}"; sleep 1 ;;
+        4) vm_info ;;
+        5) delete_vm ;;
+        0) echo "Bye."; exit 0 ;;
+        *) echo "❌ Invalid choice." ;;
     esac
-    read -p "Press Enter to continue..."
 }
 
-# ---------- Main ----------
-check_deps
-upgrade_d2vm
-mkdir -p "$VM_DIR"
-while true; do show_menu; done
+# --------------------------------------------
+# 8. Init
+# --------------------------------------------
+init() {
+    mkdir -p "$VM_BASE_DIR"
+    install_qemu
+    check_kvm
+    echo "✅ VM Manager ready (VMs in $VM_BASE_DIR)"
+}
+
+init
+while true; do
+    main_menu
+    read -p "⏎ Press Enter to continue..."
+done
