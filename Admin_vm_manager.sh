@@ -7,7 +7,6 @@ set -e
 VM_BASE_DIR="${VM_BASE_DIR:-$HOME/vms}"
 SSH_DEFAULT_PORT=2222
 
-# Ensure base directory exists and is absolute
 mkdir -p "$VM_BASE_DIR"
 VM_BASE_DIR=$(realpath "$VM_BASE_DIR")
 
@@ -26,17 +25,6 @@ install_qemu() {
         yum install -y qemu-kvm qemu-img curl genisoimage
     else
         echo "❌ Unsupported OS. Install QEMU manually."
-        exit 1
-    fi
-}
-
-check_kvm() {
-    if [ ! -e /dev/kvm ]; then
-        echo "❌ /dev/kvm missing – mount it with -v /dev/kvm:/dev/kvm"
-        exit 1
-    fi
-    if [ ! -w /dev/kvm ]; then
-        echo "❌ /dev/kvm not writable – run with --privileged or --group-add=$(stat -c '%g' /dev/kvm)"
         exit 1
     fi
 }
@@ -79,7 +67,7 @@ download_image() {
 }
 
 # --------------------------------------------
-# 3. Cloud-init ISO generation (for Ubuntu/Debian)
+# 3. Cloud-init ISO generation
 # --------------------------------------------
 create_cloud_init_iso() {
     local vm_dir="$1" username="$2" password="$3" hostname="$4"
@@ -139,7 +127,7 @@ get_vm_list() {
 }
 
 # --------------------------------------------
-# 5. Interactive selection (FIXED)
+# 5. Interactive selection
 # --------------------------------------------
 select_vm() {
     local vms=($(get_vm_list))
@@ -273,6 +261,9 @@ EOF
     echo "🔌 SSH: ssh -p $ssh_port $username@localhost"
 }
 
+# --------------------------------------------
+# start_vm – no KVM, pure software emulation
+# --------------------------------------------
 start_vm() {
     local vm_name=$(select_vm) || return 1
     local vm_dir="$VM_BASE_DIR/$vm_name"
@@ -284,7 +275,8 @@ start_vm() {
     source "$vm_dir/config.conf"
 
     local cmd="qemu-system-x86_64"
-    cmd+=" -enable-kvm -m $MEMORY -smp cores=$CPUS -cpu host"
+    # Remove -enable-kvm and -cpu host → software emulation
+    cmd+=" -m $MEMORY -smp cores=$CPUS"
     cmd+=" -drive file=$IMAGE,format=qcow2"
     [[ -f "$CLOUD_ISO" ]] && cmd+=" -cdrom $CLOUD_ISO"
     cmd+=" -nic user,hostfwd=tcp::$SSH_PORT-:22"
@@ -296,7 +288,6 @@ start_vm() {
             cmd+=",hostfwd=tcp::$host_port-:$guest_port"
         done
     fi
-    # Floppy disabled – we don't add -fda at all
     if [[ "$GUI" == [yY] ]]; then
         cmd+=" -vnc :0"
         echo "🖥️  VNC on port 5900 (inside container)."
@@ -304,7 +295,7 @@ start_vm() {
         cmd+=" -nographic"
     fi
 
-    echo "🚀 Starting VM '$vm_name' (SSH port $SSH_PORT)..."
+    echo "🚀 Starting VM '$vm_name' (SSH port $SSH_PORT) using software emulation..."
     read -p "Run in background? (y/n, default n): " bg
     if [[ "$bg" == [yY] ]]; then
         cmd+=" -daemonize -pidfile $vm_dir/pid"
@@ -322,6 +313,9 @@ start_vm() {
     fi
 }
 
+# --------------------------------------------
+# stop_vm, vm_info, delete_vm unchanged
+# --------------------------------------------
 stop_vm() {
     local vm_name=$(select_vm) || return 1
     local vm_dir="$VM_BASE_DIR/$vm_name"
@@ -371,7 +365,7 @@ main_menu() {
     echo ""
     echo "📋 Main Menu"
     echo "  1) 🆕 Create VM"
-    echo "  2) 🚀 Start VM"
+    echo "  2) 🚀 Start VM (software emulation)"
     echo "  3) 🛑 Stop VM"
     echo "  4) 📊 VM Info"
     echo "  5) 🗑️  Delete VM"
@@ -389,12 +383,13 @@ main_menu() {
 }
 
 # --------------------------------------------
-# 8. Init
+# 8. Init – no KVM check
 # --------------------------------------------
 init() {
     mkdir -p "$VM_BASE_DIR"
     install_qemu
-    check_kvm
+    # KVM check removed
+    echo "⚠️  Running without KVM – using software emulation (slower)."
     echo "✅ VM Manager ready (VMs in $VM_BASE_DIR)"
 }
 
