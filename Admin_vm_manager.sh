@@ -7,60 +7,97 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${GREEN}================================================${NC}"
-echo -e "${GREEN}   Fixing Redis & Panel Services               ${NC}"
+echo -e "${GREEN}   Starting Panel Services (No systemd)        ${NC}"
 echo -e "${GREEN}================================================${NC}"
 
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}❌ This script must be run as root.${NC}"
-   exit 1
-fi
-
-# 1. Install Redis
-echo -e "${GREEN}📦 Installing Redis...${NC}"
-apt update
-apt install -y redis-server
-
-# 2. Start Redis and enable on boot
-echo -e "${GREEN}🚀 Starting Redis...${NC}"
-systemctl start redis-server
-systemctl enable redis-server
-
-# Verify Redis is running
-if systemctl is-active --quiet redis-server; then
-    echo -e "${GREEN}✅ Redis is running.${NC}"
+# 1. Start Redis
+echo -e "${GREEN}🔴 Starting Redis...${NC}"
+if pgrep -x "redis-server" > /dev/null; then
+    echo -e "${YELLOW}Redis is already running.${NC}"
 else
-    echo -e "${RED}❌ Redis failed to start. Check logs: journalctl -u redis-server${NC}"
-    exit 1
+    redis-server --daemonize yes
+    sleep 1
+    if pgrep -x "redis-server" > /dev/null; then
+        echo -e "${GREEN}✅ Redis started.${NC}"
+    else
+        echo -e "${RED}❌ Redis failed to start.${NC}"
+    fi
 fi
 
-# 3. Configure Panel .env for Redis (if not already set)
-echo -e "${GREEN}🔧 Checking Panel .env configuration...${NC}"
-cd /var/www/pterodactyl || exit
+# 2. Detect PHP version and start PHP-FPM
+echo -e "${GREEN}🐘 Starting PHP-FPM...${NC}"
+PHP_FPM=""
+for version in 8.3 8.2 8.1 8.0; do
+    if command -v php-fpm$version > /dev/null; then
+        PHP_FPM="php-fpm$version"
+        break
+    fi
+done
+if [[ -z "$PHP_FPM" ]]; then
+    # Try generic name
+    if command -v php-fpm > /dev/null; then
+        PHP_FPM="php-fpm"
+    fi
+fi
 
-# Set Redis host (should be localhost, default)
+if [[ -n "$PHP_FPM" ]]; then
+    if pgrep -f "$PHP_FPM" > /dev/null; then
+        echo -e "${YELLOW}PHP-FPM is already running.${NC}"
+    else
+        $PHP_FPM -D
+        sleep 1
+        if pgrep -f "$PHP_FPM" > /dev/null; then
+            echo -e "${GREEN}✅ PHP-FPM started ($PHP_FPM).${NC}"
+        else
+            echo -e "${RED}❌ PHP-FPM failed to start.${NC}"
+        fi
+    fi
+else
+    echo -e "${RED}❌ No PHP-FPM found.${NC}"
+fi
+
+# 3. Start Nginx
+echo -e "${GREEN}🌐 Starting Nginx...${NC}"
+if pgrep -x "nginx" > /dev/null; then
+    echo -e "${YELLOW}Nginx is already running.${NC}"
+else
+    nginx -g "daemon off;" &
+    sleep 2
+    if pgrep -x "nginx" > /dev/null; then
+        echo -e "${GREEN}✅ Nginx started.${NC}"
+    else
+        echo -e "${RED}❌ Nginx failed to start.${NC}"
+    fi
+fi
+
+# 4. Ensure Panel .env has correct Redis config
+echo -e "${GREEN}🔧 Configuring Panel .env for Redis...${NC}"
+cd /var/www/pterodactyl || exit
 sed -i "s|REDIS_HOST=.*|REDIS_HOST=127.0.0.1|" .env
 sed -i "s|REDIS_PORT=.*|REDIS_PORT=6379|" .env
 sed -i "s|REDIS_PASSWORD=.*|REDIS_PASSWORD=null|" .env
 
-# 4. Clear cache and restart services
-echo -e "${GREEN}🔄 Clearing cache and restarting services...${NC}"
+# 5. Clear cache and run migrations
+echo -e "${GREEN}🗑️  Clearing cache...${NC}"
 php artisan config:clear
 php artisan cache:clear
 php artisan view:clear
+
+echo -e "${GREEN}📦 Running migrations...${NC}"
+php artisan migrate --force
+
+# 6. Restart queue worker
+echo -e "${GREEN}🔄 Restarting queue worker...${NC}"
 php artisan queue:restart
 
-# 5. Restart Nginx and PHP-FPM
-systemctl restart nginx
-systemctl restart php8.1-fpm 2>/dev/null || systemctl restart php8.2-fpm 2>/dev/null || systemctl restart php8.0-fpm 2>/dev/null || echo -e "${YELLOW}⚠️  Could not restart PHP-FPM – check PHP version.${NC}"
-
-# 6. Check panel health
-echo -e "${GREEN}✅ Fix complete. Testing panel...${NC}"
-curl -s -o /dev/null -w "Panel HTTP status: %{http_code}\n" http://localhost
-
-# 7. Final message
+# 7. Final check
+echo -e "${GREEN}✅ Services started.${NC}"
+echo ""
 echo -e "${GREEN}================================================${NC}"
-echo -e "${GREEN}✅ All fixed!${NC}"
+echo -e "${GREEN}   Panel should now be accessible               ${NC}"
 echo -e "${GREEN}================================================${NC}"
-echo -e "Try accessing your panel again at ${BLUE}https://your-domain${NC}"
-echo -e "If you still see 502, restart Nginx manually: ${BLUE}systemctl restart nginx${NC}"
+echo -e "Try visiting your domain: ${BLUE}https://your-domain${NC}"
+echo ""
+echo -e "${YELLOW}💡 To keep services running in the background:${NC}"
+echo -e "   If you close this terminal, services may stop."
+echo -e "   Use 'nohup' or 'screen' to keep them running."
