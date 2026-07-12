@@ -1,46 +1,16 @@
 #!/bin/bash
 set -e
 
-# --- Usage ---
-if [[ "$1" == "--help" || "$1" == "-h" ]]; then
-    echo "Usage: $0 --token TOKEN --domain DOMAIN [--tunnel NAME]"
-    echo "  --token    Cloudflare Tunnel token (required)"
-    echo "  --domain   Your domain (e.g., panel.example.com) (required)"
-    echo "  --tunnel   Tunnel name (default: pterodactyl-panel)"
-    exit 0
-fi
-
-# Parse arguments
-TOKEN=""
-DOMAIN=""
-TUNNEL_NAME="pterodactyl-panel"
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --token) TOKEN="$2"; shift 2 ;;
-        --domain) DOMAIN="$2"; shift 2 ;;
-        --tunnel) TUNNEL_NAME="$2"; shift 2 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
-done
-
-if [[ -z "$TOKEN" || -z "$DOMAIN" ]]; then
-    echo "❌ Both --token and --domain are required."
-    exit 1
-fi
-
 # Colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${GREEN}================================================${NC}"
-echo -e "${GREEN}  Pterodactyl Panel + Cloudflare Tunnel (Auto) ${NC}"
+echo -e "${GREEN}  Pterodactyl Panel + Cloudflare Tunnel (Full) ${NC}"
 echo -e "${GREEN}================================================${NC}"
-echo "Token: ${TOKEN:0:10}..."
-echo "Domain: $DOMAIN"
-echo "Tunnel: $TUNNEL_NAME"
 
 # Check root
 if [[ $EUID -ne 0 ]]; then
@@ -48,8 +18,55 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# ---- Gather all inputs ----
+echo -e "\n${YELLOW}Please provide the following information:${NC}"
+
+read -p "Cloudflare Tunnel token: " TOKEN
+if [[ -z "$TOKEN" ]]; then
+    echo -e "${RED}❌ Token is required.${NC}"
+    exit 1
+fi
+
+read -p "Domain (e.g., panel.yourdomain.com): " DOMAIN
+if [[ -z "$DOMAIN" ]]; then
+    echo -e "${RED}❌ Domain is required.${NC}"
+    exit 1
+fi
+
+read -p "Tunnel name (default: pterodactyl-panel): " TUNNEL_NAME
+TUNNEL_NAME=${TUNNEL_NAME:-pterodactyl-panel}
+
+read -p "Admin email (default: admin@$DOMAIN): " ADMIN_EMAIL
+ADMIN_EMAIL=${ADMIN_EMAIL:-admin@$DOMAIN}
+
+read -p "Admin username (default: admin): " ADMIN_USER
+ADMIN_USER=${ADMIN_USER:-admin}
+
+while true; do
+    read -s -p "Admin password: " ADMIN_PASS
+    echo
+    read -s -p "Confirm admin password: " ADMIN_PASS_CONF
+    echo
+    if [[ "$ADMIN_PASS" == "$ADMIN_PASS_CONF" && -n "$ADMIN_PASS" ]]; then
+        break
+    else
+        echo -e "${RED}Passwords do not match or are empty. Try again.${NC}"
+    fi
+done
+
+# Generate a random database password if not provided
+read -s -p "Database password (press Enter to auto-generate): " DB_PASS
+echo
+if [[ -z "$DB_PASS" ]]; then
+    DB_PASS=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-16)
+    echo -e "${YELLOW}Auto-generated database password: $DB_PASS${NC}"
+fi
+
+echo -e "\n${GREEN}All inputs collected. Starting installation...${NC}"
+sleep 2
+
 # --------------------------------------------
-# 1. Install base deps
+# 1. Install base dependencies
 # --------------------------------------------
 echo -e "${GREEN}📦 Step 1: Installing system dependencies...${NC}"
 apt update && apt upgrade -y
@@ -67,44 +84,34 @@ mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
 cloudflared --version
 
 # Install service with token
-echo -e "${GREEN}Installing cloudflared service with provided token...${NC}"
 cloudflared service install "$TOKEN"
 systemctl enable --now cloudflared
 sleep 2
-if systemctl is-active --quiet cloudflared; then
-    echo -e "${GREEN}✅ Cloudflared service is running.${NC}"
-else
-    echo -e "${YELLOW}⚠️  Cloudflared service failed to start. Check logs: journalctl -u cloudflared${NC}"
-fi
 
 # --------------------------------------------
 # 3. Install Pterodactyl Panel (non-interactive)
 # --------------------------------------------
-echo -e "${GREEN}🐧 Step 3: Installing Pterodactyl Panel...${NC}"
-echo -e "${YELLOW}Using the official installer. It will ask for database and admin credentials.${NC}"
-echo -e "${YELLOW}We recommend: DB: pterodactyl, User: pterodactyl, Pass: a strong one.${NC}"
-echo -e "${YELLOW}Admin: admin@$DOMAIN / your password.${NC}"
-echo -e "${YELLOW}Press Enter to continue, or Ctrl+C to abort.${NC}"
-read
+echo -e "${GREEN}🐧 Step 3: Installing Pterodactyl Panel (fully automated)...${NC}"
+echo -e "${YELLOW}Using BoryaGames installer with environment variables.${NC}"
 
-# Use the official installer (panel only)
-bash <(curl -s https://pterodactyl-installer.se) -panel
+export PTERO_EMAIL="$ADMIN_EMAIL"
+export PTERO_USERNAME="$ADMIN_USER"
+export PTERO_PASSWORD="$ADMIN_PASS"
+export PTERO_DB_PASSWORD="$DB_PASS"
+
+bash <(curl -s https://raw.githubusercontent.com/BoryaGames/pterodactyl-install/refs/heads/main/pterodactyl-install.sh) full
 
 # --------------------------------------------
-# 4. Configure Panel to use domain
+# 4. Configure Panel for the domain
 # --------------------------------------------
 echo -e "${GREEN}🔧 Step 4: Configuring Panel for domain $DOMAIN...${NC}"
 cd /var/www/pterodactyl || exit
-# Update .env
 sed -i "s|APP_URL=.*|APP_URL=https://$DOMAIN|" .env
-# Update Nginx server_name
 sed -i "s|server_name .*;|server_name $DOMAIN;|" /etc/nginx/sites-available/pterodactyl
 systemctl restart nginx
 
-echo -e "${GREEN}Panel configured for https://$DOMAIN${NC}"
-
 # --------------------------------------------
-# 5. Set up Cloudflare Tunnel ingress
+# 5. Configure Cloudflare Tunnel ingress
 # --------------------------------------------
 echo -e "${GREEN}🌐 Step 5: Configuring Cloudflare Tunnel for $DOMAIN...${NC}"
 mkdir -p /root/.cloudflared
@@ -117,27 +124,22 @@ ingress:
   - service: http_status:404
 EOF
 
-# Route DNS (assumes domain is already in Cloudflare)
 cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN" || echo -e "${YELLOW}⚠️  DNS route may already exist or DNS not in Cloudflare.${NC}"
-
-# Restart tunnel
 systemctl restart cloudflared
 
-echo -e "${GREEN}✅ Tunnel configured for $DOMAIN${NC}"
-
 # --------------------------------------------
-# 6. Final message
+# 6. Done
 # --------------------------------------------
 echo -e "${GREEN}================================================${NC}"
 echo -e "${GREEN}✅ Installation complete!${NC}"
 echo -e "${GREEN}================================================${NC}"
-echo ""
 echo -e "🔗 Access your panel: ${BLUE}https://$DOMAIN${NC}"
-echo -e "🔒 SSL is handled by Cloudflare (flexible mode)."
-echo -e "👤 Admin login: The credentials you set during the installer."
+echo -e "🔒 SSL is provided by Cloudflare (flexible mode)."
+echo -e "👤 Admin login: ${BLUE}$ADMIN_USER${NC} / your password."
+echo -e "📧 Admin email: ${BLUE}$ADMIN_EMAIL${NC}"
+echo -e "🗄️  Database password: ${BLUE}$DB_PASS${NC} (save this!)"
 echo ""
 echo -e "${YELLOW}💡 Useful commands:${NC}"
 echo -e "  - Tunnel status: ${BLUE}systemctl status cloudflared${NC}"
 echo -e "  - Panel status:  ${BLUE}systemctl status nginx${NC}"
 echo -e "  - Tunnel logs:   ${BLUE}journalctl -u cloudflared -f${NC}"
-echo -e "  - Re-route DNS:  ${BLUE}cloudflared tunnel route dns $TUNNEL_NAME $DOMAIN${NC}"
