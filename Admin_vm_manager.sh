@@ -34,7 +34,6 @@ for version in 8.3 8.2 8.1 8.0; do
     fi
 done
 if [[ -z "$PHP_FPM" ]]; then
-    # Try generic name
     if command -v php-fpm > /dev/null; then
         PHP_FPM="php-fpm"
     fi
@@ -98,6 +97,6 @@ echo -e "${GREEN}   Panel should now be accessible               ${NC}"
 echo -e "${GREEN}================================================${NC}"
 echo -e "Try visiting your domain: ${BLUE}https://your-domain${NC}"
 echo ""
-echo -e "${YELLOW}💡 To keep services running in the background:${NC}"
+echo -e "${YELLOW}💡 To keep services running:${NC}"
 echo -e "   If you close this terminal, services may stop."
 echo -e "   Use 'nohup' or 'screen' to keep them running."
