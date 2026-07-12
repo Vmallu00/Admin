@@ -2,8 +2,8 @@
 set -e
 
 # ================================================
-#  Auto‑Create & Run Persistent Ubuntu VM
-#  Works inside Docker / Daytona sandboxes
+#  Persistent Ubuntu VM with Screen Console
+#  Works in Daytona / Docker containers
 # ================================================
 
 GREEN='\033[0;32m'
@@ -14,40 +14,16 @@ NC='\033[0m'
 
 VM_DIR="/root/my-vm"
 DISK_FILE="$VM_DIR/disk.qcow2"
-PID_FILE="$VM_DIR/vm.pid"
 LOG_FILE="$VM_DIR/vm.log"
-SEED_ISO="$VM_DIR/seed.iso"
-
-# ------------------- Helper functions -------------------
-vm_running() {
-    if [[ -f "$PID_FILE" ]]; then
-        local pid=$(cat "$PID_FILE")
-        if ps -p "$pid" >/dev/null 2>&1; then
-            return 0
-        fi
-    fi
-    # Also check by process name
-    if pgrep -f "qemu-system-x86_64.*$DISK_FILE" >/dev/null; then
-        return 0
-    fi
-    return 1
-}
-
-get_vm_pid() {
-    if [[ -f "$PID_FILE" ]]; then
-        cat "$PID_FILE"
-    else
-        pgrep -f "qemu-system-x86_64.*$DISK_FILE" | head -1
-    fi
-}
+SCREEN_NAME="vm-console"
 
 # ------------------- Install dependencies -------------------
 install_qemu() {
     if command -v apt &>/dev/null; then
         apt update
-        apt install -y qemu-system-x86 qemu-utils curl genisoimage --no-install-recommends
+        apt install -y qemu-system-x86 qemu-utils curl genisoimage screen --no-install-recommends
     elif command -v apk &>/dev/null; then
-        apk add --no-cache qemu-system-x86_64 qemu-img curl genisoimage
+        apk add --no-cache qemu-system-x86_64 qemu-img curl genisoimage screen
     else
         echo -e "${RED}❌ Unsupported package manager.${NC}"
         exit 1
@@ -81,6 +57,10 @@ create_vm() {
     echo -e "   RAM: ${BLUE}${ram_mb}MB${NC}"
     echo -e "   CPU: ${BLUE}${cpu_cores} cores${NC}"
     echo -e "   Disk: ${BLUE}${disk_size}GB${NC}"
+
+    # Save config for later start
+    echo "$ram_mb" > config.ram
+    echo "$cpu_cores" > config.cpu
 
     # Install QEMU if missing
     install_qemu
@@ -131,10 +111,18 @@ EOF
     genisoimage -output seed.iso -volid cidata -joliet -rock user-data meta-data 2>/dev/null || mkisofs -output seed.iso -volid cidata -joliet -rock user-data meta-data
 }
 
-# ------------------- Start VM in background -------------------
+# ------------------- Start VM inside a screen session -------------------
 start_vm() {
-    if vm_running; then
-        echo -e "${YELLOW}VM is already running (PID: $(get_vm_pid))${NC}"
+    # Ensure screen is installed
+    if ! command -v screen &>/dev/null; then
+        echo -e "${YELLOW}Installing screen...${NC}"
+        install_qemu
+    fi
+
+    # Check if already running in screen
+    if screen -list | grep -q "$SCREEN_NAME"; then
+        echo -e "${YELLOW}VM is already running in screen session '$SCREEN_NAME'.${NC}"
+        echo -e "${YELLOW}To attach: screen -r $SCREEN_NAME${NC}"
         return 0
     fi
 
@@ -145,11 +133,10 @@ start_vm() {
     fi
 
     cd "$VM_DIR"
-
-    # Build QEMU command
     ram_mb=$(cat config.ram 2>/dev/null || echo "2048")
     cpu_cores=$(cat config.cpu 2>/dev/null || echo "2")
 
+    # Build QEMU command
     CMD="qemu-system-x86_64"
     CMD+=" -m ${ram_mb} -smp cores=${cpu_cores}"
 
@@ -165,82 +152,69 @@ start_vm() {
     CMD+=" -nic user,hostfwd=tcp::2222-:22"
     CMD+=" -nographic"
 
-    echo -e "${GREEN}🚀 Starting VM in background...${NC}"
+    echo -e "${GREEN}🚀 Starting VM in screen session '$SCREEN_NAME'...${NC}"
     echo -e "${YELLOW}   SSH: ssh -p 2222 admin@localhost (password: admin)${NC}"
-    echo -e "${YELLOW}   Logs: tail -f $LOG_FILE${NC}"
-
-    nohup $CMD > "$LOG_FILE" 2>&1 &
-    local pid=$!
-    echo $pid > "$PID_FILE"
-
+    echo -e "${YELLOW}   Console will open in a new screen session.${NC}"
+    echo -e "${YELLOW}   To detach: Ctrl+A then D${NC}"
+    echo -e "${YELLOW}   To reattach later: screen -r $SCREEN_NAME${NC}"
     sleep 2
-    if vm_running; then
-        echo -e "${GREEN}✅ VM started (PID: $pid)${NC}"
-    else
-        echo -e "${RED}❌ VM failed to start. Check $LOG_FILE${NC}"
-    fi
+
+    # Create a screen session and run QEMU
+    screen -dmS "$SCREEN_NAME" bash -c "$CMD; exec bash"
+    sleep 1
+    # Attach to it so user sees the console immediately
+    screen -r "$SCREEN_NAME"
 }
 
 # ------------------- Stop VM -------------------
 stop_vm() {
-    if ! vm_running; then
-        echo -e "${YELLOW}VM is not running.${NC}"
-        return 0
+    if screen -list | grep -q "$SCREEN_NAME"; then
+        echo -e "${RED}🛑 Stopping VM (screen session)...${NC}"
+        screen -S "$SCREEN_NAME" -X quit
+        echo -e "${GREEN}✅ VM stopped.${NC}"
+    else
+        echo -e "${YELLOW}VM is not running (no screen session found).${NC}"
     fi
-    local pid=$(get_vm_pid)
-    echo -e "${RED}🛑 Stopping VM (PID: $pid)...${NC}"
-    kill "$pid" 2>/dev/null || true
-    sleep 2
-    if vm_running; then
-        kill -9 "$pid" 2>/dev/null || true
-    fi
-    rm -f "$PID_FILE"
-    echo -e "${GREEN}✅ VM stopped.${NC}"
 }
 
 # ------------------- Status -------------------
 status_vm() {
-    if vm_running; then
-        echo -e "${GREEN}✅ VM is running (PID: $(get_vm_pid))${NC}"
+    if screen -list | grep -q "$SCREEN_NAME"; then
+        echo -e "${GREEN}✅ VM is running in screen session '$SCREEN_NAME'.${NC}"
         echo -e "   SSH: ssh -p 2222 admin@localhost (password: admin)"
+        echo -e "   Attach: screen -r $SCREEN_NAME"
     else
         echo -e "${RED}❌ VM is stopped.${NC}"
     fi
 }
 
-# ------------------- Console -------------------
+# ------------------- Attach to console -------------------
 console_vm() {
-    if ! vm_running; then
+    if screen -list | grep -q "$SCREEN_NAME"; then
+        echo -e "${YELLOW}Attaching to VM console...${NC}"
+        echo -e "${YELLOW}To detach: Ctrl+A then D${NC}"
+        sleep 1
+        screen -r "$SCREEN_NAME"
+    else
         echo -e "${RED}❌ VM is not running. Start it first.${NC}"
-        return 1
     fi
-    echo -e "${YELLOW}Attaching to VM console. Press Ctrl+A then X to detach (does not stop VM).${NC}"
-    sleep 2
-    # Use socat to connect to the serial? We can't easily attach to an existing nohup process's stdin/out.
-    # Instead, we can suggest using `screen` to run the VM in the first place.
-    # For simplicity, we'll just tell them to use `tail -f` on the log or SSH.
-    echo -e "${YELLOW}To see console output: tail -f $LOG_FILE${NC}"
-    echo -e "${YELLOW}To interact: SSH into the VM using port 2222${NC}"
 }
 
-# ------------------- Auto-start setup -------------------
+# ------------------- Setup auto-start -------------------
 setup_autostart() {
     echo -e "${GREEN}Setting up auto-start on container boot...${NC}"
     SCRIPT_PATH="$(realpath "$0")"
-    # Add to .bashrc (runs when shell starts)
-    if ! grep -q "start-vm" ~/.bashrc; then
+    if ! grep -q "$SCRIPT_PATH start" ~/.bashrc 2>/dev/null; then
         echo "($SCRIPT_PATH start) &" >> ~/.bashrc
         echo -e "${GREEN}✅ Added to ~/.bashrc (will start on shell login)${NC}"
     else
         echo -e "${YELLOW}Already in ~/.bashrc${NC}"
     fi
-    # Alternatively, use cron @reboot if available
     if command -v crontab &>/dev/null; then
         (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" ; echo "@reboot $SCRIPT_PATH start > /dev/null 2>&1") | crontab -
         echo -e "${GREEN}✅ Added cron @reboot job.${NC}"
     else
         echo -e "${YELLOW}⚠️  cron not installed – auto-start may not work on container restart.${NC}"
-        echo -e "${YELLOW}   Install cron: apt install -y cron && systemctl enable cron${NC}"
     fi
 }
 
@@ -248,13 +222,13 @@ setup_autostart() {
 main_menu() {
     echo ""
     echo -e "${GREEN}================================================${NC}"
-    echo -e "${GREEN}   Persistent Ubuntu VM Manager              ${NC}"
+    echo -e "${GREEN}   Persistent Ubuntu VM with Screen Console  ${NC}"
     echo -e "${GREEN}================================================${NC}"
     echo "  1) Create VM (if not exists)"
-    echo "  2) Start VM (background)"
+    echo "  2) Start VM (with console)"
     echo "  3) Stop VM"
     echo "  4) VM Status"
-    echo "  5) Attach to console (logs/SSH info)"
+    echo "  5) Attach to console (reattach)"
     echo "  6) Setup auto-start on boot"
     echo "  0) Exit"
     read -p "Choice: " choice
