@@ -1,120 +1,66 @@
 #!/bin/bash
 set -e
 
-# =============================================
-#  Pterodactyl Panel Only (No Cloudflare)
-#  Ubuntu 22.04 / 24.04
-# =============================================
-
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${GREEN}================================================${NC}"
-echo -e "${GREEN}       Pterodactyl Panel Installer             ${NC}"
+echo -e "${GREEN}   Fixing Redis & Panel Services               ${NC}"
 echo -e "${GREEN}================================================${NC}"
 
-# Root check
+# Check if running as root
 if [[ $EUID -ne 0 ]]; then
    echo -e "${RED}❌ This script must be run as root.${NC}"
    exit 1
 fi
 
-# ---- Gather inputs ----
-echo -e "\n${YELLOW}Please provide the following information:${NC}"
+# 1. Install Redis
+echo -e "${GREEN}📦 Installing Redis...${NC}"
+apt update
+apt install -y redis-server
 
-read -p "Domain (e.g., panel.yourdomain.com): " DOMAIN
-if [[ -z "$DOMAIN" ]]; then
-    echo -e "${RED}❌ Domain is required.${NC}"
+# 2. Start Redis and enable on boot
+echo -e "${GREEN}🚀 Starting Redis...${NC}"
+systemctl start redis-server
+systemctl enable redis-server
+
+# Verify Redis is running
+if systemctl is-active --quiet redis-server; then
+    echo -e "${GREEN}✅ Redis is running.${NC}"
+else
+    echo -e "${RED}❌ Redis failed to start. Check logs: journalctl -u redis-server${NC}"
     exit 1
 fi
 
-read -p "Admin email (default: admin@$DOMAIN): " ADMIN_EMAIL
-ADMIN_EMAIL=${ADMIN_EMAIL:-admin@$DOMAIN}
-
-read -p "Admin username (default: admin): " ADMIN_USER
-ADMIN_USER=${ADMIN_USER:-admin}
-
-while true; do
-    read -s -p "Admin password: " ADMIN_PASS
-    echo
-    read -s -p "Confirm admin password: " ADMIN_PASS_CONF
-    echo
-    if [[ -z "$ADMIN_PASS" ]]; then
-        echo -e "${RED}❌ Password cannot be empty.${NC}"
-    elif [[ "$ADMIN_PASS" == "$ADMIN_PASS_CONF" ]]; then
-        break
-    else
-        echo -e "${RED}❌ Passwords do not match.${NC}"
-    fi
-done
-
-read -s -p "Database password (press Enter to auto-generate): " DB_PASS
-echo
-if [[ -z "$DB_PASS" ]]; then
-    DB_PASS=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-16)
-    echo -e "${YELLOW}Auto-generated database password: $DB_PASS${NC}"
-fi
-
-echo -e "\n${GREEN}All inputs collected. Starting installation...${NC}"
-sleep 2
-
-# --------------------------------------------
-# 1. Install base dependencies
-# --------------------------------------------
-echo -e "${GREEN}📦 Step 1: Installing system dependencies...${NC}"
-apt update && apt upgrade -y
-apt install -y curl wget git unzip software-properties-common \
-    gnupg2 ca-certificates lsb-release apt-transport-https \
-    zip unzip openssl
-
-# --------------------------------------------
-# 2. Install Pterodactyl Panel (auto, no prompts)
-# --------------------------------------------
-echo -e "${GREEN}🐧 Step 2: Installing Pterodactyl Panel...${NC}"
-echo -e "${YELLOW}Using BoryaGames installer with environment variables.${NC}"
-
-export PTERO_EMAIL="$ADMIN_EMAIL"
-export PTERO_USERNAME="$ADMIN_USER"
-export PTERO_PASSWORD="$ADMIN_PASS"
-export PTERO_DB_PASSWORD="$DB_PASS"
-
-# The 'panel' option installs only the panel (no Wings)
-bash <(curl -s https://raw.githubusercontent.com/BoryaGames/pterodactyl-install/refs/heads/main/pterodactyl-install.sh) panel
-
-# --------------------------------------------
-# 3. Configure Panel for the domain
-# --------------------------------------------
-echo -e "${GREEN}🔧 Step 3: Configuring Panel for domain $DOMAIN...${NC}"
+# 3. Configure Panel .env for Redis (if not already set)
+echo -e "${GREEN}🔧 Checking Panel .env configuration...${NC}"
 cd /var/www/pterodactyl || exit
 
-# Update .env with the domain (HTTPS because Cloudflare provides SSL)
-sed -i "s|APP_URL=.*|APP_URL=https://$DOMAIN|" .env
+# Set Redis host (should be localhost, default)
+sed -i "s|REDIS_HOST=.*|REDIS_HOST=127.0.0.1|" .env
+sed -i "s|REDIS_PORT=.*|REDIS_PORT=6379|" .env
+sed -i "s|REDIS_PASSWORD=.*|REDIS_PASSWORD=null|" .env
 
-# Update Nginx server_name
-sed -i "s|server_name .*;|server_name $DOMAIN;|" /etc/nginx/sites-available/pterodactyl
+# 4. Clear cache and restart services
+echo -e "${GREEN}🔄 Clearing cache and restarting services...${NC}"
+php artisan config:clear
+php artisan cache:clear
+php artisan view:clear
+php artisan queue:restart
 
-# Restart Nginx
+# 5. Restart Nginx and PHP-FPM
 systemctl restart nginx
+systemctl restart php8.1-fpm 2>/dev/null || systemctl restart php8.2-fpm 2>/dev/null || systemctl restart php8.0-fpm 2>/dev/null || echo -e "${YELLOW}⚠️  Could not restart PHP-FPM – check PHP version.${NC}"
 
-# --------------------------------------------
-# 4. Show credentials
-# --------------------------------------------
+# 6. Check panel health
+echo -e "${GREEN}✅ Fix complete. Testing panel...${NC}"
+curl -s -o /dev/null -w "Panel HTTP status: %{http_code}\n" http://localhost
+
+# 7. Final message
 echo -e "${GREEN}================================================${NC}"
-echo -e "${GREEN}✅ Installation complete!${NC}"
+echo -e "${GREEN}✅ All fixed!${NC}"
 echo -e "${GREEN}================================================${NC}"
-echo ""
-echo -e "🔗 Panel URL:      ${BLUE}https://$DOMAIN${NC}"
-echo -e "👤 Admin login:    ${BLUE}$ADMIN_USER${NC}"
-echo -e "📧 Admin email:    ${BLUE}$ADMIN_EMAIL${NC}"
-echo -e "🔑 Admin password: ${BLUE}$ADMIN_PASS${NC} (save this!)"
-echo -e "🗄️  DB password:    ${BLUE}$DB_PASS${NC} (save this!)"
-echo ""
-echo -e "${YELLOW}💡 Next Steps:${NC}"
-echo -e "  1. Visit your panel at ${BLUE}https://$DOMAIN${NC}"
-echo -e "  2. Log in with the admin credentials above."
-echo -e "  3. Configure your Wings nodes from the Admin area if needed."
-echo ""
-echo -e "${GREEN}Your panel is ready! 🎉${NC}"
+echo -e "Try accessing your panel again at ${BLUE}https://your-domain${NC}"
+echo -e "If you still see 502, restart Nginx manually: ${BLUE}systemctl restart nginx${NC}"
