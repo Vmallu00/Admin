@@ -100,13 +100,7 @@ sed -i "s|server_name .*;|server_name $DOMAIN;|" /etc/nginx/sites-available/pter
 systemctl restart nginx
 
 # --------------------------------------------
-# 4. Optional: Set up Let's Encrypt? (But Cloudflare handles SSL)
-# --------------------------------------------
-echo -e "${YELLOW}Since you're using Cloudflare Tunnel, SSL is already handled.${NC}"
-echo -e "${YELLOW}You do not need to install Certbot.${NC}"
-
-# --------------------------------------------
-# 5. Show credentials
+# 4. Show credentials
 # --------------------------------------------
 echo -e "${GREEN}================================================${NC}"
 echo -e "${GREEN}✅ Installation complete!${NC}"
