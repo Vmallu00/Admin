@@ -326,7 +326,7 @@ services:
       - POINTS_RENEW_30=${POINTS_RENEW_30:-5}
       - VPS_LIFETIME_DAYS=${VPS_LIFETIME_DAYS:-15}
       - GUILD_ID=${GUILD_ID:-1432390408184529084}
-      - OWNER_ID=${OWNER_ID:-1397506807089598474}
+      - OWNER_ID=${OWNER_ID:-1447083500720230401}
     volumes:
       - ${BOT_VOLUME_NAME}:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
